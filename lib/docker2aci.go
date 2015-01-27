@@ -46,6 +46,11 @@ type DockerURL struct {
 	Tag       string
 }
 
+type ACIApp struct {
+	ACILayers     []string
+	PathWhitelist []string
+}
+
 const (
 	defaultIndex  = "index.docker.io"
 	defaultTag    = "latest"
@@ -84,18 +89,16 @@ func Convert(dockerURL string, outputDir string) ([]string, error) {
 		return nil, err
 	}
 
-	var aciLayerPaths []string
+	aciACC := new(ACIApp)
 	for _, layerID := range ancestry {
-		aciPath, err := buildACI(layerID, repoData, parsedURL, outputDir)
+		aciACC, err = buildACI(layerID, repoData, parsedURL, aciACC, outputDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error building layer: %v\n", err)
 			return nil, err
 		}
-
-		aciLayerPaths = append(aciLayerPaths, aciPath)
 	}
 
-	return aciLayerPaths, nil
+	return aciACC.ACILayers, nil
 }
 
 func parseDockerURL(arg string) *DockerURL {
@@ -245,10 +248,10 @@ func getAncestry(imgID, registry string, repoData *RepoData) ([]string, error) {
 	return ancestry, nil
 }
 
-func buildACI(layerID string, repoData *RepoData, dockerURL *DockerURL, outputDir string) (string, error) {
+func buildACI(layerID string, repoData *RepoData, dockerURL *DockerURL, acc *ACIApp, outputDir string) (*ACIApp, error) {
 	tmpDir, err := ioutil.TempDir("", "docker2aci-")
 	if err != nil {
-		return "", fmt.Errorf("Error creating dir: %v", err)
+		return nil, fmt.Errorf("Error creating dir: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -256,29 +259,24 @@ func buildACI(layerID string, repoData *RepoData, dockerURL *DockerURL, outputDi
 	layerRootfs := layerDest + "/rootfs"
 	err = os.MkdirAll(layerRootfs, 0700)
 	if err != nil {
-		return "", fmt.Errorf("Error creating dir: %s", layerRootfs)
+		return nil, fmt.Errorf("Error creating dir: %s", layerRootfs)
 	}
 
 	jsonString, size, err := getRemoteImageJSON(layerID, repoData.Endpoints[0], repoData)
 	if err != nil {
-		return "", fmt.Errorf("Error getting image json: %v", err)
+		return nil, fmt.Errorf("Error getting image json: %v", err)
 	}
 
 	layerData := DockerImageData{}
 	if err := json.Unmarshal(jsonString, &layerData); err != nil {
-		return "", fmt.Errorf("Error unmarshaling layer data: %v", err)
+		return nil, fmt.Errorf("Error unmarshaling layer data: %v", err)
 	}
 
 	layer, err := getRemoteLayer(layerID, repoData.Endpoints[0], repoData, int64(size))
 	if err != nil {
-		return "", fmt.Errorf("Error getting the remote layer: %v", err)
+		return nil, fmt.Errorf("Error getting the remote layer: %v", err)
 	}
 	defer layer.Close()
-
-	manifest, err := generateManifest(layerData, dockerURL)
-	if err != nil {
-		return "", fmt.Errorf("Error generating the manifest: %v", err)
-	}
 
 	imageName := strings.Replace(dockerURL.ImageName, "/", "-", -1)
 	aciPath := imageName + "-" + layerID
@@ -295,11 +293,15 @@ func buildACI(layerID string, repoData *RepoData, dockerURL *DockerURL, outputDi
 
 	aciPath = path.Join(outputDir, aciPath)
 
-	if err := writeACI(layer, manifest, aciPath); err != nil {
-		return "", fmt.Errorf("Error writing ACI: %v", err)
+	newPathWhitelist, err := writeACI(layer, layerData, dockerURL, acc.PathWhitelist, aciPath)
+	if err != nil {
+		return nil, fmt.Errorf("Error writing ACI: %v", err)
 	}
 
-	return aciPath, nil
+	acc.ACILayers = append(acc.ACILayers, aciPath)
+	acc.PathWhitelist = newPathWhitelist
+
+	return acc, nil
 }
 
 func getRemoteImageJSON(imgID, registry string, repoData *RepoData) ([]byte, int, error) {
@@ -362,7 +364,7 @@ func getRemoteLayer(imgID, registry string, repoData *RepoData, imgSize int64) (
 	return res.Body, nil
 }
 
-func generateManifest(layerData DockerImageData, dockerURL *DockerURL) (*schema.ImageManifest, error) {
+func generateManifest(layerData DockerImageData, dockerURL *DockerURL, pathWhitelist []string) (*schema.ImageManifest, error) {
 	dockerConfig := layerData.Config
 	genManifest := &schema.ImageManifest{}
 
@@ -430,6 +432,10 @@ func generateManifest(layerData DockerImageData, dockerURL *DockerURL) (*schema.
 		genManifest.Dependencies = dependencies
 	}
 
+	if len(pathWhitelist) > 0 {
+		genManifest.PathWhitelist = pathWhitelist
+	}
+
 	return genManifest, nil
 }
 
@@ -447,25 +453,87 @@ func parseDockerUser(dockerUser string) (string, string) {
 	return dockerUserParts[0], dockerUserParts[1]
 }
 
-func writeACI(layer io.Reader, manifest *schema.ImageManifest, output string) error {
+func in(list []string, el string) bool {
+	for _, x := range list {
+		if el == x {
+			return true
+		}
+	}
+	return false
+}
+
+func substractWhiteouts(pathWhitelist []string, whiteouts []string) []string {
+	for i, whiteout := range whiteouts {
+		if in(pathWhitelist, whiteout) {
+			pathWhitelist = append(pathWhitelist[:i], pathWhitelist[i+1:]...)
+		}
+	}
+
+	return pathWhitelist
+}
+
+func writeACI(layer io.Reader, layerData DockerImageData, dockerURL *DockerURL, curPathWhitelist []string, output string) ([]string, error) {
 	reader, err := decompress(layer)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	tr := tar.NewReader(reader)
 
 	aciFile, err := os.Create(output)
 	if err != nil {
-		return fmt.Errorf("Error creating ACI file: %v", err)
+		return nil, fmt.Errorf("Error creating ACI file: %v", err)
 	}
 	defer aciFile.Close()
 
 	trw := tar.NewWriter(aciFile)
 
+	var whiteouts []string
+	// Write files in rootfs/
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			// end of tar archive
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Error reading layer tar entry: %v", err)
+		}
+		if hdr.Name == "./" {
+			continue
+		}
+		absolutePath := "/" + hdr.Name
+
+		// FIXME(iaguis) although unlikely, a file named like "/what.wh.ever should be legal
+		if strings.Index(absolutePath, ".wh.") != -1 {
+			whiteouts = append(whiteouts, strings.Replace(absolutePath, ".wh.", "", -1))
+			continue
+		}
+		hdr.Name = "rootfs/" + hdr.Name
+		if hdr.Typeflag == tar.TypeLink {
+			hdr.Linkname = "rootfs/" + hdr.Linkname
+		}
+		if err := trw.WriteHeader(hdr); err != nil {
+			return nil, fmt.Errorf("Error writing header: %v", err)
+		}
+		if _, err := io.Copy(trw, tr); err != nil {
+			return nil, fmt.Errorf("Error copying file into the tar out: %v", err)
+		}
+		if !in(curPathWhitelist, absolutePath) {
+			curPathWhitelist = append(curPathWhitelist, absolutePath)
+		}
+	}
+
+	pathWhitelist := substractWhiteouts(curPathWhitelist, whiteouts)
+
+	manifest, err := generateManifest(layerData, dockerURL, pathWhitelist)
+	if err != nil {
+		return nil, fmt.Errorf("Error generating the manifest: %v", err)
+	}
+
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Write manifest
@@ -475,42 +543,17 @@ func writeACI(layer io.Reader, manifest *schema.ImageManifest, output string) er
 		Size: int64(len(manifestBytes)),
 	}
 	if err := trw.WriteHeader(hdr); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := trw.Write(manifestBytes); err != nil {
-		return err
-	}
-
-	// Write files in rootfs/
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			// end of tar archive
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("Error reading layer tar entry: %v", err)
-		}
-		if hdr.Name == "./" {
-			continue
-		}
-		hdr.Name = "rootfs/" + hdr.Name
-		if hdr.Typeflag == tar.TypeLink {
-			hdr.Linkname = "rootfs/" + hdr.Linkname
-		}
-		if err := trw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("Error writing header: %v", err)
-		}
-		if _, err := io.Copy(trw, tr); err != nil {
-			return fmt.Errorf("Error copying file into the tar out: %v", err)
-		}
+		return nil, err
 	}
 
 	if err := trw.Close(); err != nil {
-		return fmt.Errorf("Error closing ACI file: %v", err)
+		return nil, fmt.Errorf("Error closing ACI file: %v", err)
 	}
 
-	return nil
+	return pathWhitelist, nil
 }
 
 func setAuthToken(req *http.Request, token []string) {
