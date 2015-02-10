@@ -25,6 +25,7 @@ import (
 const (
 	defaultTag    = "latest"
 	schemaVersion = "0.1.1"
+	labelBaseURL  = "appc.io/docker/v1"
 )
 
 // Convert generates ACI images from docker registry URLs.
@@ -377,6 +378,43 @@ func getRemoteLayer(imgID, registry string, repoData *RepoData, imgSize int64) (
 	return res.Body, nil
 }
 
+func generateLabels(layerData DockerImageData, dockerURL *ParsedDockerURL) types.Labels {
+	var labels types.Labels
+
+	if layerData.Checksum != "" {
+		checksumName, _ := types.NewACName(path.Join(labelBaseURL, "checksum"))
+		labels = append(labels, types.Label{*checksumName, layerData.Checksum})
+	}
+	if dockerURL.Tag != "" {
+		tagName, _ := types.NewACName(path.Join(labelBaseURL, "tag"))
+		labels = append(labels, types.Label{*tagName, dockerURL.Tag})
+	}
+	if dockerURL.IndexURL != "" {
+		repositoryName, _ := types.NewACName(path.Join(labelBaseURL, "repository"))
+		labels = append(labels, types.Label{*repositoryName, dockerURL.IndexURL})
+	}
+	if layerData.ID != "" {
+		imageIDName, _ := types.NewACName(path.Join(labelBaseURL, "imageid"))
+		labels = append(labels, types.Label{*imageIDName, layerData.ID})
+	}
+	if layerData.Parent != "" {
+		parentIDName, _ := types.NewACName(path.Join(labelBaseURL, "parentid"))
+		labels = append(labels, types.Label{*parentIDName, layerData.Parent})
+	}
+
+	if layerData.OS != "" {
+		osName, _ := types.NewACName("os")
+		labels = append(labels, types.Label{*osName, layerData.OS})
+
+		if layerData.Architecture != "" {
+			archName, _ := types.NewACName("arch")
+			labels = append(labels, types.Label{*archName, layerData.Architecture})
+		}
+	}
+
+	return labels
+}
+
 func generateManifest(layerData DockerImageData, dockerURL *ParsedDockerURL) (*schema.ImageManifest, error) {
 	dockerConfig := layerData.Config
 	genManifest := &schema.ImageManifest{}
@@ -392,29 +430,17 @@ func generateManifest(layerData DockerImageData, dockerURL *ParsedDockerURL) (*s
 	genManifest.ACVersion = *acVersion
 
 	genManifest.ACKind = types.ACKind("ImageManifest")
+	genManifest.Labels = generateLabels(layerData, dockerURL)
 
-	var labels types.Labels
 	var parentLabels types.Labels
-
-	layer, _ := types.NewACName("layer")
-	labels = append(labels, types.Label{Name: *layer, Value: layerData.ID})
-
-	tag := dockerURL.Tag
-	version, _ := types.NewACName("version")
-	labels = append(labels, types.Label{Name: *version, Value: tag})
-
-	if layerData.OS != "" {
-		os, _ := types.NewACName("os")
-		labels = append(labels, types.Label{Name: *os, Value: layerData.OS})
-		parentLabels = append(parentLabels, types.Label{Name: *os, Value: layerData.OS})
-
-		if layerData.Architecture != "" {
-			arch, _ := types.NewACName("arch")
-			parentLabels = append(parentLabels, types.Label{Name: *arch, Value: layerData.Architecture})
-		}
+	if os, ok := genManifest.Labels.Get("os"); ok {
+		osName, _ := types.NewACName("os")
+		parentLabels = append(parentLabels, types.Label{*osName, os})
 	}
-
-	genManifest.Labels = labels
+	if arch, ok := genManifest.Labels.Get("arch"); ok {
+		archName, _ := types.NewACName("arch")
+		parentLabels = append(parentLabels, types.Label{*archName, arch})
+	}
 
 	if dockerConfig != nil {
 		var exec types.Exec
@@ -717,22 +743,29 @@ func reduceACIs(outputWriter *tar.Writer, fileMap map[string]string, currentPath
 	return outputWriter, nil
 }
 
+func removeLabel(labels types.Labels, labelName string) types.Labels {
+	layerIndex := -1
+	for i, l := range labels {
+		if l.Name.String() == labelName {
+			layerIndex = i
+		}
+	}
+
+	if layerIndex != -1 {
+		labels = append(labels[:layerIndex], labels[layerIndex+1:]...)
+	}
+
+	return labels
+}
+
 func mergeManifests(manifests []schema.ImageManifest) schema.ImageManifest {
 	// FIXME(iaguis) we take last layer's manifest as the final manifest for now
 	manifest := manifests[len(manifests)-1]
 
 	manifest.Dependencies = nil
 
-	layerIndex := -1
-	for i, l := range manifest.Labels {
-		if l.Name.String() == "layer" {
-			layerIndex = i
-		}
-	}
-
-	if layerIndex != -1 {
-		manifest.Labels = append(manifest.Labels[:layerIndex], manifest.Labels[layerIndex+1:]...)
-	}
+	manifest.Labels = removeLabel(manifest.Labels, "layer")
+	manifest.Labels = removeLabel(manifest.Labels, path.Join(labelBaseURL, "parentid"))
 
 	// this can't fail because the old name is legal
 	nameWithoutLayerID, _ := types.NewACName(strings.Split(manifest.Name.String(), "-")[0])
