@@ -23,6 +23,9 @@ import (
 
 	"github.com/appc/docker2aci/lib"
 	"github.com/appc/docker2aci/lib/util"
+
+	"github.com/appc/spec/aci"
+	"github.com/appc/spec/schema/types"
 )
 
 var (
@@ -65,12 +68,60 @@ func runDocker2ACI(arg string, flagNoSquash bool, flagImage string, flagDebug bo
 		return fmt.Errorf("conversion error: %v", err)
 	}
 
+	if squash {
+		if err := printConvertedVolumes(aciLayerPaths[0]); err != nil {
+			return err
+		}
+	}
+
 	fmt.Printf("\nGenerated ACI(s):\n")
 	for _, aciFile := range aciLayerPaths {
 		fmt.Println(aciFile)
 	}
 
 	return nil
+}
+
+func printConvertedVolumes(aciPath string) error {
+	mps, err := getMountPoints(aciPath)
+	if err != nil {
+		return err
+	}
+
+	if len(mps) > 0 {
+		fmt.Printf("\nConverted volumes:\n\t")
+		convertedVolumes := []string{}
+		for _, mp := range mps {
+			msg := fmt.Sprintf("name: %q, path: %q, readOnly: %v",
+				mp.Name, mp.Path, mp.ReadOnly)
+
+			convertedVolumes = append(convertedVolumes, msg)
+		}
+
+		fmt.Printf(strings.Join(convertedVolumes, "\n\t"))
+		fmt.Printf("\n")
+	}
+
+	return nil
+}
+
+func getMountPoints(aciPath string) ([]types.MountPoint, error) {
+	f, err := os.Open(aciPath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening converted image: %v", err)
+	}
+	defer f.Close()
+
+	manifest, err := aci.ManifestFromImage(f)
+	if err != nil {
+		return nil, fmt.Errorf("error reading manifest from converted image: %v", err)
+	}
+
+	if manifest.App != nil && manifest.App.MountPoints != nil {
+		return manifest.App.MountPoints, nil
+	}
+
+	return []types.MountPoint{}, nil
 }
 
 func usage() {
